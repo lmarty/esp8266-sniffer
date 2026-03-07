@@ -1,136 +1,265 @@
-extern "C" {
-  #include <user_interface.h>
-}
+/**
+ * ESP32 WiFi Probe Request Sniffer — Lab POC
+ *
+ * Educational demonstration of what 802.11 probe requests reveal:
+ * each nearby device broadcasts its list of previously-joined networks
+ * in plaintext, along with a MAC address that may or may not be stable.
+ *
+ * This device passively captures those frames and builds a per-device
+ * profile (MAC -> set of queried SSIDs) that it prints to the serial
+ * monitor.  Nothing is transmitted; no connections are made.
+ *
+ * Intended for single-device, controlled lab use only.
+ * Observe all applicable local laws before deployment.
+ */
 
-#define DATA_LENGTH           112
+#include <Arduino.h>
+#include <map>
+#include <set>
+#include <string>
+#include "esp_wifi.h"
+#include "esp_system.h"
 
-#define TYPE_MANAGEMENT       0x00
-#define TYPE_CONTROL          0x01
-#define TYPE_DATA             0x02
-#define SUBTYPE_PROBE_REQUEST 0x04
+// ── Configuration ────────────────────────────────────────────────────────────
 
+// Maximum number of distinct MACs held in memory at once.
+// Oldest entries are evicted when the limit is reached.
+#define MAX_TRACKED_DEVICES    64
 
-struct RxControl {
- signed rssi:8; // signal intensity of packet
- unsigned rate:4;
- unsigned is_group:1;
- unsigned:1;
- unsigned sig_mode:2; // 0:is 11n packet; 1:is not 11n packet;
- unsigned legacy_length:12; // if not 11n packet, shows length of packet.
- unsigned damatch0:1;
- unsigned damatch1:1;
- unsigned bssidmatch0:1;
- unsigned bssidmatch1:1;
- unsigned MCS:7; // if is 11n packet, shows the modulation and code used (range from 0 to 76)
- unsigned CWB:1; // if is 11n packet, shows if is HT40 packet or not
- unsigned HT_length:16;// if is 11n packet, shows length of packet.
- unsigned Smoothing:1;
- unsigned Not_Sounding:1;
- unsigned:1;
- unsigned Aggregation:1;
- unsigned STBC:2;
- unsigned FEC_CODING:1; // if is 11n packet, shows if is LDPC packet or not.
- unsigned SGI:1;
- unsigned rxend_state:8;
- unsigned ampdu_cnt:8;
- unsigned channel:4; //which channel this packet in.
- unsigned:12;
+// Maximum unique SSIDs stored per device before further ones are dropped.
+#define MAX_SSIDS_PER_DEVICE   30
+
+// Time (ms) spent listening on each channel before hopping.
+#define CHANNEL_HOP_INTERVAL_MS  500
+
+// Interval (ms) between full profile summaries printed to serial.
+#define SUMMARY_INTERVAL_MS    15000
+
+// Channels to cycle through (1–13 covers most regulatory domains).
+static const uint8_t CHANNELS[] = {1,2,3,4,5,6,7,8,9,10,11,12,13};
+#define NUM_CHANNELS (sizeof(CHANNELS) / sizeof(CHANNELS[0]))
+
+// ── 802.11 frame constants ────────────────────────────────────────────────────
+
+#define TYPE_MANAGEMENT        0x00
+#define SUBTYPE_PROBE_REQUEST  0x04
+
+// Fixed 802.11 management frame header offsets (bytes):
+//   0–1   Frame Control
+//   2–3   Duration
+//   4–9   Destination Address  (DA — broadcast FF:FF:FF:FF:FF:FF)
+//  10–15  Source Address       (SA — the probing device)
+//  16–21  BSSID                (broadcast FF:FF:FF:FF:FF:FF)
+//  22–23  Sequence Control
+//  24     First IE tag (0x00 = SSID)
+//  25     SSID length
+//  26+    SSID bytes
+#define OFFSET_SRC_MAC         10
+#define OFFSET_SSID_TAG        24
+#define OFFSET_SSID_LEN        25
+#define OFFSET_SSID_DATA       26
+#define MIN_PROBE_FRAME_LEN    27   // FC(2)+Dur(2)+DA(6)+SA(6)+BSSID(6)+Seq(2)+IE_tag(1)+IE_len(1)+FCS(4)
+
+// ── Storage ───────────────────────────────────────────────────────────────────
+
+struct DeviceProfile {
+    std::set<std::string> ssids;   // networks this device has probed for
+    int8_t  lastRssi    = 0;
+    uint8_t lastChannel = 0;
+    uint32_t probeCount = 0;
+    bool    macRandomized = false;
 };
 
-struct SnifferPacket{
-    struct RxControl rx_ctrl;
-    uint8_t data[DATA_LENGTH];
-    uint16_t cnt;
-    uint16_t len;
-};
+// MAC string (lower-case colon-hex) → profile
+static std::map<std::string, DeviceProfile> deviceProfiles;
 
-static void showMetadata(SnifferPacket *snifferPacket) {
+// Ordered insertion list — used to evict oldest entry when map is full.
+// Simple ring-style tracking; accurate enough for a lab POC.
+static std::string insertionOrder[MAX_TRACKED_DEVICES];
+static uint8_t insertionHead = 0;   // points to the oldest entry slot
 
-  unsigned int frameControl = ((unsigned int)snifferPacket->data[1] << 8) + snifferPacket->data[0];
+static uint32_t totalProbePackets = 0;
 
-  uint8_t version      = (frameControl & 0b0000000000000011) >> 0;
-  uint8_t frameType    = (frameControl & 0b0000000000001100) >> 2;
-  uint8_t frameSubType = (frameControl & 0b0000000011110000) >> 4;
-  uint8_t toDS         = (frameControl & 0b0000000100000000) >> 8;
-  uint8_t fromDS       = (frameControl & 0b0000001000000000) >> 9;
+// ── Channel state ─────────────────────────────────────────────────────────────
 
-  // Only look for probe request packets
-  if (frameType != TYPE_MANAGEMENT ||
-      frameSubType != SUBTYPE_PROBE_REQUEST)
-        return;
+static uint8_t  channelIndex   = 0;
+static uint32_t lastChannelHop = 0;
+static uint32_t lastSummary    = 0;
 
-  Serial.print("RSSI: ");
-  Serial.print(snifferPacket->rx_ctrl.rssi, DEC);
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-  Serial.print(" Ch: ");
-  Serial.print(wifi_get_channel());
-
-  char addr[] = "00:00:00:00:00:00";
-  getMAC(addr, snifferPacket->data, 10);
-  Serial.print(" Peer MAC: ");
-  Serial.print(addr);
-
-  uint8_t SSID_length = snifferPacket->data[25];
-  Serial.print(" SSID: ");
-  printDataSpan(26, SSID_length, snifferPacket->data);
-
-  Serial.println();
+static std::string formatMAC(const uint8_t* mac) {
+    char buf[18];
+    snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return std::string(buf);
 }
 
-/**
- * Callback for promiscuous mode
- */
-static void ICACHE_FLASH_ATTR sniffer_callback(uint8_t *buffer, uint16_t length) {
-  struct SnifferPacket *snifferPacket = (struct SnifferPacket*) buffer;
-  showMetadata(snifferPacket);
+// The locally-administered bit (bit 1 of the first octet) is set by
+// iOS / Android / Windows when using MAC randomisation.
+static bool isRandomizedMAC(const uint8_t* mac) {
+    return (mac[0] & 0x02) != 0;
 }
 
-static void printDataSpan(uint16_t start, uint16_t size, uint8_t* data) {
-  for(uint16_t i = start; i < DATA_LENGTH && i < start+size; i++) {
-    Serial.write(data[i]);
-  }
+// ── Promiscuous callback ──────────────────────────────────────────────────────
+
+static void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+    // We only asked for management frames via the filter below, but guard anyway.
+    if (type != WIFI_PKT_MGMT) return;
+
+    const wifi_promiscuous_pkt_t* pkt =
+        reinterpret_cast<const wifi_promiscuous_pkt_t*>(buf);
+    const uint8_t* data = pkt->payload;
+
+    // sig_len includes the 4-byte FCS on ESP32; ensure usable payload is long enough.
+    uint16_t len = pkt->rx_ctrl.sig_len;
+    if (len < MIN_PROBE_FRAME_LEN) return;
+
+    // ── Frame-control field (little-endian, bytes 0–1) ──
+    // Bits [3:2] = frame type  |  bits [7:4] = frame subtype
+    uint8_t frameType    = (data[0] >> 2) & 0x03;
+    uint8_t frameSubtype = (data[0] >> 4) & 0x0F;
+
+    if (frameType != TYPE_MANAGEMENT || frameSubtype != SUBTYPE_PROBE_REQUEST) return;
+
+    totalProbePackets++;
+
+    // ── Source MAC (offset 10) ──
+    const uint8_t* srcMAC = data + OFFSET_SRC_MAC;
+    std::string macStr    = formatMAC(srcMAC);
+
+    // ── SSID information element ──
+    // Verify the IE tag is actually SSID (0x00) before trusting the length.
+    if (data[OFFSET_SSID_TAG] != 0x00) return;
+
+    uint8_t ssidLen = data[OFFSET_SSID_LEN];
+    std::string ssid;
+
+    if (ssidLen == 0) {
+        // Wildcard probe — device will associate with any network it knows.
+        // Common on modern OSes to reduce fingerprinting surface.
+        ssid = "<wildcard>";
+    } else if ((OFFSET_SSID_DATA + ssidLen) <= (len - 4)) {
+        // Directed probe — device is asking for a specific network.
+        ssid = std::string(reinterpret_cast<const char*>(data + OFFSET_SSID_DATA), ssidLen);
+    } else {
+        return;  // Malformed / truncated
+    }
+
+    int8_t  rssi    = pkt->rx_ctrl.rssi;
+    uint8_t channel = pkt->rx_ctrl.channel;
+
+    // ── Log this packet to serial immediately ──
+    Serial.printf("[Ch%02d] RSSI %4d dBm  %s%s  \"%s\"\n",
+        channel, rssi,
+        macStr.c_str(),
+        isRandomizedMAC(srcMAC) ? "  [rand]" : "        ",
+        ssid.c_str());
+
+    // ── Update in-memory profile ──
+    // If we haven't seen this MAC before and are at capacity, evict oldest.
+    if (deviceProfiles.find(macStr) == deviceProfiles.end()) {
+        if (static_cast<int>(deviceProfiles.size()) >= MAX_TRACKED_DEVICES) {
+            deviceProfiles.erase(insertionOrder[insertionHead]);
+        }
+        insertionOrder[insertionHead] = macStr;
+        insertionHead = (insertionHead + 1) % MAX_TRACKED_DEVICES;
+    }
+
+    DeviceProfile& profile = deviceProfiles[macStr];
+    profile.lastRssi      = rssi;
+    profile.lastChannel   = channel;
+    profile.probeCount++;
+    profile.macRandomized = isRandomizedMAC(srcMAC);
+
+    if (profile.ssids.size() < MAX_SSIDS_PER_DEVICE) {
+        profile.ssids.insert(ssid);
+    }
 }
 
-static void getMAC(char *addr, uint8_t* data, uint16_t offset) {
-  sprintf(addr, "%02x:%02x:%02x:%02x:%02x:%02x", data[offset+0], data[offset+1], data[offset+2], data[offset+3], data[offset+4], data[offset+5]);
+// ── Summary printer ───────────────────────────────────────────────────────────
+
+static void printSummary() {
+    Serial.println();
+    Serial.println("══════════════ DEVICE PROFILE SUMMARY ══════════════");
+    Serial.printf( "  Devices tracked: %-4d  Total probe packets: %lu\n",
+                   deviceProfiles.size(), totalProbePackets);
+    Serial.println("─────────────────────────────────────────────────────");
+
+    for (auto& kv : deviceProfiles) {
+        const std::string&   mac     = kv.first;
+        const DeviceProfile& profile = kv.second;
+
+        Serial.printf("  %s  %s  probes: %-5lu  last RSSI: %d dBm\n",
+            mac.c_str(),
+            profile.macRandomized ? "[RANDOMIZED]" : "[STABLE    ]",
+            profile.probeCount,
+            profile.lastRssi);
+
+        Serial.printf("    Networks queried (%d):\n", profile.ssids.size());
+        for (auto& s : profile.ssids) {
+            Serial.printf("      \"%s\"\n", s.c_str());
+        }
+    }
+
+    Serial.println("═════════════════════════════════════════════════════");
+    Serial.println();
 }
 
-#define CHANNEL_HOP_INTERVAL_MS   1000
-static os_timer_t channelHop_timer;
-
-/**
- * Callback for channel hoping
- */
-void channelHop()
-{
-  // hoping channels 1-14
-  uint8 new_channel = wifi_get_channel() + 1;
-  if (new_channel > 14)
-    new_channel = 1;
-  wifi_set_channel(new_channel);
-}
-
-#define DISABLE 0
-#define ENABLE  1
+// ── Arduino entry points ──────────────────────────────────────────────────────
 
 void setup() {
-  // set the WiFi chip to "promiscuous" mode aka monitor mode
-  Serial.begin(115200);
-  delay(10);
-  wifi_set_opmode(STATION_MODE);
-  wifi_set_channel(1);
-  wifi_promiscuous_enable(DISABLE);
-  delay(10);
-  wifi_set_promiscuous_rx_cb(sniffer_callback);
-  delay(10);
-  wifi_promiscuous_enable(ENABLE);
+    Serial.begin(115200);
+    delay(500);
 
-  // setup the channel hoping callback timer
-  os_timer_disarm(&channelHop_timer);
-  os_timer_setfn(&channelHop_timer, (os_timer_func_t *) channelHop, NULL);
-  os_timer_arm(&channelHop_timer, CHANNEL_HOP_INTERVAL_MS, 1);
+    Serial.println();
+    Serial.println("ESP32 Probe Request Sniffer — Lab POC");
+    Serial.println("Educational use only. Observe local laws.");
+    Serial.println("──────────────────────────────────────");
+
+    // Reduce CPU frequency to save power (promiscuous mode doesn't need 240 MHz).
+    setCpuFrequencyMhz(80);
+
+    // Bluetooth is unused — shut it down to save ~30 mA.
+    btStop();
+
+    // Initialise WiFi driver in NULL (monitor-only) mode.
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+    esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    esp_wifi_set_mode(WIFI_MODE_NULL);
+    esp_wifi_start();
+
+    // Filter to management frames only — reduces callback frequency significantly.
+    wifi_promiscuous_filter_t filter = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
+    esp_wifi_set_promiscuous_filter(&filter);
+
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_promiscuous_rx_cb(snifferCallback);
+
+    // Start on first channel.
+    esp_wifi_set_channel(CHANNELS[channelIndex], WIFI_SECOND_CHAN_NONE);
+    Serial.printf("Listening on channel %d...\n\n", CHANNELS[channelIndex]);
+
+    lastChannelHop = millis();
+    lastSummary    = millis();
 }
 
 void loop() {
-  delay(10);
+    uint32_t now = millis();
+
+    // ── Channel hop ──
+    if (now - lastChannelHop >= CHANNEL_HOP_INTERVAL_MS) {
+        lastChannelHop = now;
+        channelIndex   = (channelIndex + 1) % NUM_CHANNELS;
+        esp_wifi_set_channel(CHANNELS[channelIndex], WIFI_SECOND_CHAN_NONE);
+    }
+
+    // ── Periodic profile summary ──
+    if (now - lastSummary >= SUMMARY_INTERVAL_MS) {
+        lastSummary = now;
+        printSummary();
+    }
+
+    delay(10);
 }
