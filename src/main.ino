@@ -17,6 +17,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <sys/time.h>
 #include "esp_wifi.h"
 #include "esp_system.h"
 
@@ -88,12 +89,48 @@ static uint32_t lastSummary    = 0;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// Returns elapsed time since boot as a fixed-width "HH:MM:SS" string.
-// Uses millis() — the only time source available without NTP or an RTC module.
-// Safe to call from ISR context (millis() reads a hardware counter).
-static void formatUptime(char* buf, size_t bufLen) {
-    uint32_t s = millis() / 1000;
-    snprintf(buf, bufLen, "%02lu:%02lu:%02lu", s / 3600, (s % 3600) / 60, s % 60);
+// ── Wall-clock seeding (compile-time) ────────────────────────────────────────
+//
+// The preprocessor macros __DATE__ ("Mar  8 2026") and __TIME__ ("14:30:00")
+// are baked in at build time.  We parse them once in setup() and call
+// settimeofday() so the ESP32 software RTC keeps wall-clock time for the
+// duration of the session without any external hardware or network access.
+//
+// Accuracy: the internal crystal drifts ~±40 ppm; over a typical lab session
+// (a few hours) that is well within a few seconds — perfectly adequate.
+
+static void seedClockFromBuildTime() {
+    // Parse __TIME__ = "HH:MM:SS"
+    struct tm t = {};
+    sscanf(__TIME__, "%d:%d:%d", &t.tm_hour, &t.tm_min, &t.tm_sec);
+
+    // Parse __DATE__ = "Mon DD YYYY" (day may be space-padded, e.g. "Mar  8 2026")
+    char mon[4] = {};
+    sscanf(__DATE__, "%3s %d %d", mon, &t.tm_mday, &t.tm_year);
+    t.tm_year -= 1900;
+
+    static const char* months[12] = {
+        "Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"
+    };
+    for (int i = 0; i < 12; i++) {
+        if (strncmp(mon, months[i], 3) == 0) { t.tm_mon = i; break; }
+    }
+    t.tm_isdst = -1;
+
+    time_t epoch = mktime(&t);
+    struct timeval tv = { epoch, 0 };
+    settimeofday(&tv, nullptr);
+}
+
+// Formats the current wall-clock time as "HH:MM:SS" into buf.
+// Uses localtime_r (reentrant) so it is safe to call from the promiscuous
+// callback, which runs at interrupt priority.
+static void formatTime(char* buf, size_t bufLen) {
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    struct tm t;
+    localtime_r(&tv.tv_sec, &t);
+    strftime(buf, bufLen, "%H:%M:%S", &t);
 }
 
 static std::string formatMAC(const uint8_t* mac) {
@@ -159,7 +196,7 @@ static void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t typ
 
     // ── Log this packet to serial immediately ──
     char ts[9];
-    formatUptime(ts, sizeof(ts));
+    formatTime(ts, sizeof(ts));
     Serial.printf("[%s][Ch%02d] RSSI %4d dBm  %s%s  \"%s\"\n",
         ts, channel, rssi,
         macStr.c_str(),
@@ -191,7 +228,7 @@ static void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t typ
 
 static void printSummary() {
     char ts[9];
-    formatUptime(ts, sizeof(ts));
+    formatTime(ts, sizeof(ts));
     Serial.println();
     Serial.printf( "══════════════ DEVICE PROFILE SUMMARY  %s ══════════════\n", ts);
     Serial.printf( "  Devices tracked: %-4d  Total probe packets: %lu\n",
@@ -228,6 +265,13 @@ void setup() {
     Serial.println("ESP32 Probe Request Sniffer — Lab POC");
     Serial.println("Educational use only. Observe local laws.");
     Serial.println("──────────────────────────────────────");
+
+    // Seed the software RTC from the compile-time timestamp.
+    // The clock keeps wall time for the session via the internal crystal.
+    seedClockFromBuildTime();
+    char ts[9];
+    formatTime(ts, sizeof(ts));
+    Serial.printf("Clock set to build time: %s (%s %s)\n", ts, __DATE__, __TIME__);
 
     // Reduce CPU frequency to save power (promiscuous mode doesn't need 240 MHz).
     setCpuFrequencyMhz(80);
