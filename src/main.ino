@@ -88,6 +88,14 @@ static uint32_t lastSummary    = 0;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+// Returns elapsed time since boot as a fixed-width "HH:MM:SS" string.
+// Uses millis() — the only time source available without NTP or an RTC module.
+// Safe to call from ISR context (millis() reads a hardware counter).
+static void formatUptime(char* buf, size_t bufLen) {
+    uint32_t s = millis() / 1000;
+    snprintf(buf, bufLen, "%02lu:%02lu:%02lu", s / 3600, (s % 3600) / 60, s % 60);
+}
+
 static std::string formatMAC(const uint8_t* mac) {
     char buf[18];
     snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x",
@@ -150,8 +158,10 @@ static void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t typ
     uint8_t channel = pkt->rx_ctrl.channel;
 
     // ── Log this packet to serial immediately ──
-    Serial.printf("[Ch%02d] RSSI %4d dBm  %s%s  \"%s\"\n",
-        channel, rssi,
+    char ts[9];
+    formatUptime(ts, sizeof(ts));
+    Serial.printf("[%s][Ch%02d] RSSI %4d dBm  %s%s  \"%s\"\n",
+        ts, channel, rssi,
         macStr.c_str(),
         isRandomizedMAC(srcMAC) ? "  [rand]" : "        ",
         ssid.c_str());
@@ -180,8 +190,10 @@ static void IRAM_ATTR snifferCallback(void* buf, wifi_promiscuous_pkt_type_t typ
 // ── Summary printer ───────────────────────────────────────────────────────────
 
 static void printSummary() {
+    char ts[9];
+    formatUptime(ts, sizeof(ts));
     Serial.println();
-    Serial.println("══════════════ DEVICE PROFILE SUMMARY ══════════════");
+    Serial.printf( "══════════════ DEVICE PROFILE SUMMARY  %s ══════════════\n", ts);
     Serial.printf( "  Devices tracked: %-4d  Total probe packets: %lu\n",
                    deviceProfiles.size(), totalProbePackets);
     Serial.println("─────────────────────────────────────────────────────");
